@@ -23,7 +23,7 @@ add `src/pobr/main.py`
 add `shot_.*\.png`
 
 ```bash
-hatch new pobr
+hatch run bug
 ```
 
 ## Output
@@ -254,3 +254,38 @@ Traceback (most recent call last):
     ~~~~~~~~~~~~~~~~~~^^
 RuntimeError: Unknown exception
 ```
+
+## Env
+
+
+```
+PS C:\Users\yexia> systeminfo
+OS 名称:            Microsoft Windows 11 专业版
+OS 版本:            10.0.26100 暂缺 Build 26100
+```
+
+```
+$ hatch --version
+Hatch, version 1.14.1
+
+$ hatch run python --version
+Python 3.13.2
+
+$ hatch run pip list | grep paddle
+paddleocr                3.1.0
+paddlepaddle             3.1.0
+paddlex                  3.1.3
+```
+
+RAM 16GB
+
+CPU:
+
+```
+PS C:\Users\yexia> wmic cpu get name
+Name
+AMD Ryzen 7 5800H with Radeon Graphics
+```
+
+CUDA None
+
