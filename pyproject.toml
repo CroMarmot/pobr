@@ -40,6 +40,7 @@ path = "src/pobr/__about__.py"
 [tool.hatch.envs.default.scripts]
 bug = "python src/pobr/main.py"
 bug_sync = "python src/pobr/main_sync.py"
+bug_worker = "python src/pobr/main_worker.py"
 
 [tool.hatch.envs.types]
 extra-dependencies = ["mypy>=1.0.0"]

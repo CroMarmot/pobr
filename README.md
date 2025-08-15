@@ -1,5 +1,10 @@
 # paddle ocr bug reproduce
 
+TLDR: 目前25-08-16 [暂时不要在线程中操作全局的preditor](https://github.com/PaddlePaddle/PaddleOCR/issues/15621#issuecomment-2955143480) ，可以单独一个工作线程. (类似main_worker.py)
+
+---
+
+
 ```bash
 hatch new pobr
 ```
@@ -529,4 +534,180 @@ Traceback (most recent call last):
   File "/home/esakura/.local/share/hatch/env/virtual/pobr/0wCVYwZv/pobr/lib/python3.12/site-packages/paddlex/inference/models/common/static_infer.py", line 252, in __call__
     self.predictor.run()
 RuntimeError: std::exception
+```
+
+## Diff
+
+```diff
+diff -u -w main.py main_sync.py
+--- main.py     2025-08-16 05:41:20.874672673 +0800
++++ main_sync.py        2025-08-06 16:30:18.724666868 +0800
+@@ -1,17 +1,15 @@
+-import asyncio
+ import json
+ import logging
+ import re
+ from pathlib import Path
+ 
+-import aiofiles
+ from paddleocr import PaddleOCR
+ 
+ 
+-async def append_urls_to_json(urls: list[str], file_path: str) -> None:
++def append_urls_to_json(urls: list[str], file_path: str) -> None:
+     try:
+-        async with aiofiles.open(file_path, encoding="utf-8") as f:
+-            content = await f.read()
++        with open(file_path, "r", encoding="utf-8") as f:
++            content = f.read()
+             if content.strip():  # 文件不为空
+                 existing_urls = json.loads(content)
+                 if not isinstance(existing_urls, list):
+@@ -25,11 +23,11 @@
+     updated_urls = existing_urls + [url for url in urls if url not in existing_urls]
+     print(f"{len(updated_urls)=}")
+ 
+-    async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+-        await f.write(json.dumps(updated_urls, ensure_ascii=False, indent=2))
++    with open(file_path, "w", encoding="utf-8") as f:
++        f.write(json.dumps(updated_urls, ensure_ascii=False, indent=2))
+ 
+ 
+-async def main() -> None:
++def main() -> None:
+     pocr = PaddleOCR(
+         lang="ch",
+         use_doc_orientation_classify=False,
+@@ -40,7 +38,7 @@
+     def ocr_scan(image_path: str | Path):
+         return list(pocr.predict(str(image_path))[0]["rec_texts"])
+ 
+-    async def ocr_and_extract_links():
++    def ocr_and_extract_links():
+         current_dir = Path()
+         files = [
+             p
+@@ -52,15 +50,16 @@
+         for idx, img_path in enumerate(files, start=1):
+             print(f"OCR {idx}/{len(files)} {img_path}")
+             try:
+-                yield await asyncio.to_thread(ocr_scan, str(img_path))
++                yield ocr_scan(str(img_path))  # 直接调用，无需 await
+             except Exception:
+                 logging.exception("Error")
+ 
+-    async for new_links in ocr_and_extract_links():
++    # 使用普通 for 循环替代 async for
++    for new_links in ocr_and_extract_links():
+         print(f"{len(new_links)=}")
+-        await append_urls_to_json(new_links, "bug.json")
+-        print(f"append success")
++        append_urls_to_json(new_links, "bug.json")
++        print("append success")
+ 
+ 
+ if __name__ == "__main__":
+-    asyncio.run(main())
++    main()  # 直接调用 main，无需 asyncio.run
+```
+
+```diff
+diff -u -w main.py main_worker.py
+--- main.py     2025-08-16 05:41:20.874672673 +0800
++++ main_worker.py      2025-08-16 05:44:22.541187139 +0800
+@@ -2,7 +2,9 @@
+ import json
+ import logging
+ import re
++import threading
+ from pathlib import Path
++from queue import Queue, Empty
+ 
+ import aiofiles
+ from paddleocr import PaddleOCR
+@@ -29,7 +31,15 @@
+         await f.write(json.dumps(updated_urls, ensure_ascii=False, indent=2))
+ 
+ 
+-async def main() -> None:
++class OCRWorker:
++    def __init__(self):
++        self._loop = asyncio.get_running_loop()
++        self._input_queue = Queue()
++        self.thread = threading.Thread(target=self._worker_loop, daemon=False)
++        self.thread.start()
++
++    def _worker_loop(self):
++        # ✅ 在工具线程中创建 PaddleOCR 实例
+     pocr = PaddleOCR(
+         lang="ch",
+         use_doc_orientation_classify=False,
+@@ -37,8 +47,45 @@
+         use_textline_orientation=False,
+     )
+ 
+-    def ocr_scan(image_path: str | Path):
+-        return list(pocr.predict(str(image_path))[0]["rec_texts"])
++        while True:
++            try:
++                # 获取任务
++                future, image_path = self._input_queue.get()
++                if future is None:  # 退出信号
++                    break
++
++                # 执行 OCR（在工具线程中）
++                try:
++                    result = list(pocr.predict(str(image_path))[0]["rec_texts"])
++                    # 使用 call_soon_threadsafe 把结果送回 asyncio 事件循环
++                    self._loop.call_soon_threadsafe(future.set_result, result)
++                except Exception as e:
++                    self._loop.call_soon_threadsafe(future.set_exception, e)
++
++                self._input_queue.task_done()
++
++            except Empty:
++                continue
++            except Exception as e:
++                logging.error(f"OCRWorker 线程异常: {e}", exc_info=True)
++
++    def ocr_scan(self, image_path: str | Path) -> asyncio.Future:
++        future = self._loop.create_future()
++        self._input_queue.put_nowait((future, image_path))
++        return future
++
++    def close(self):
++        self._input_queue.put_nowait((None, None))  # 发送退出信号
++
++
++async def main() -> None:
++    # 创建专用 OCR 工具线程
++    ocr_worker = OCRWorker()
++
++    try:
++        # 定义 ocr_scan 接口，与原来一致
++        async def ocr_scan(image_path: str | Path):
++            return await ocr_worker.ocr_scan(image_path)
+ 
+     async def ocr_and_extract_links():
+         current_dir = Path()
+@@ -52,14 +99,17 @@
+         for idx, img_path in enumerate(files, start=1):
+             print(f"OCR {idx}/{len(files)} {img_path}")
+             try:
+-                yield await asyncio.to_thread(ocr_scan, str(img_path))
++                    yield await ocr_scan(img_path)  
+             except Exception:
+                 logging.exception("Error")
+ 
+     async for new_links in ocr_and_extract_links():
+         print(f"{len(new_links)=}")
+         await append_urls_to_json(new_links, "bug.json")
+-        print(f"append success")
++            print("append success")
++
++    finally:
++        ocr_worker.close()
+ 
+ 
+ if __name__ == "__main__":
 ```
